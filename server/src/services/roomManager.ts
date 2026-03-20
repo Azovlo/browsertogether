@@ -1,4 +1,5 @@
 import { nanoid } from 'nanoid';
+import crypto from 'crypto';
 
 export interface User {
   id: string;
@@ -8,6 +9,7 @@ export interface User {
   hasControl: boolean;
   avatar: string;
   joinedAt: Date;
+  sessionToken: string;
 }
 
 export interface Room {
@@ -52,6 +54,7 @@ export class RoomManager {
       hasControl: true,
       avatar: this.generateAvatar(hostName),
       joinedAt: new Date(),
+      sessionToken: crypto.randomBytes(32).toString('hex'),
     };
 
     const room: Room = {
@@ -85,6 +88,7 @@ export class RoomManager {
       hasControl: false,
       avatar: this.generateAvatar(userName),
       joinedAt: new Date(),
+      sessionToken: crypto.randomBytes(32).toString('hex'),
     };
 
     room.users.set(userId, user);
@@ -141,6 +145,17 @@ export class RoomManager {
       for (const user of room.users.values()) {
         if (user.socketId === socketId) {
           return { room, user };
+        }
+      }
+    }
+    return null;
+  }
+
+  getRoomIdByToken(token: string): { userId: string; roomId: string } | null {
+    for (const room of this.rooms.values()) {
+      for (const user of room.users.values()) {
+        if (user.sessionToken === token) {
+          return { userId: user.id, roomId: room.id };
         }
       }
     }

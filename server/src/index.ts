@@ -50,7 +50,7 @@ const browserService = new BrowserService();
 
 // Routes
 app.use('/api/rooms', roomRoutes(roomManager));
-app.use('/api/files', fileRoutes());
+app.use('/api/files', fileRoutes(roomManager));
 
 // Health check
 app.get('/health', (_, res) => {

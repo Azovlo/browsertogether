@@ -1,18 +1,29 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { EventEmitter } from 'events';
+import os from 'os';
 
 interface RoomBrowser {
   context: BrowserContext;
   page: Page;
   roomId: string;
   screenshotInterval: NodeJS.Timeout | null;
+  currentFps: number;
+  currentQuality: number;
+  manualPreset: string | null;
+  lastLatency: number;
 }
+
+type QualityPreset = 'low' | 'medium' | 'high' | 'auto';
+
+const PRESETS: Record<Exclude<QualityPreset, 'auto'>, { fps: number; quality: number }> = {
+  low:    { fps: 5,  quality: 40 },
+  medium: { fps: 15, quality: 70 },
+  high:   { fps: 24, quality: 85 },
+};
 
 export class BrowserService extends EventEmitter {
   private browser: Browser | null = null;
   private roomBrowsers: Map<string, RoomBrowser> = new Map();
-  private readonly FPS = 15;
-  private readonly SCREENSHOT_INTERVAL = Math.floor(1000 / 15); // ~67ms for 15fps
 
   async init(): Promise<void> {
     if (this.browser) return;
@@ -86,6 +97,10 @@ export class BrowserService extends EventEmitter {
       page,
       roomId,
       screenshotInterval: null,
+      currentFps: 15,
+      currentQuality: 70,
+      manualPreset: null,
+      lastLatency: 0,
     };
 
     this.roomBrowsers.set(roomId, roomBrowser);
@@ -99,6 +114,12 @@ export class BrowserService extends EventEmitter {
     const roomBrowser = this.roomBrowsers.get(roomId);
     if (!roomBrowser) return;
 
+    if (roomBrowser.screenshotInterval) {
+      clearInterval(roomBrowser.screenshotInterval);
+    }
+
+    const interval = Math.floor(1000 / roomBrowser.currentFps);
+
     roomBrowser.screenshotInterval = setInterval(async () => {
       try {
         const rb = this.roomBrowsers.get(roomId);
@@ -106,7 +127,7 @@ export class BrowserService extends EventEmitter {
 
         const screenshot = await rb.page.screenshot({
           type: 'jpeg',
-          quality: 70,
+          quality: rb.currentQuality,
           fullPage: false,
         });
 
@@ -115,7 +136,112 @@ export class BrowserService extends EventEmitter {
       } catch (err) {
         // Page might have navigated or closed
       }
-    }, this.SCREENSHOT_INTERVAL);
+    }, interval);
+  }
+
+  private restartStreamWithNewSettings(roomId: string): void {
+    const rb = this.roomBrowsers.get(roomId);
+    if (!rb) return;
+
+    if (rb.screenshotInterval) {
+      clearInterval(rb.screenshotInterval);
+      rb.screenshotInterval = null;
+    }
+    this.startScreenshotStream(roomId);
+  }
+
+  /**
+   * Adapt quality based on latency, CPU load, and user count.
+   * Returns { changed, fps, quality, reason } so caller can emit event.
+   */
+  adaptQuality(
+    roomId: string,
+    latency: number,
+    userCount: number
+  ): { changed: boolean; fps: number; quality: number; reason: string } | null {
+    const rb = this.roomBrowsers.get(roomId);
+    if (!rb) return null;
+
+    // If manual preset is set, ignore adaptive logic
+    if (rb.manualPreset !== null) {
+      return null;
+    }
+
+    rb.lastLatency = latency;
+
+    const cpuLoad = os.loadavg()[0];
+
+    let fps: number;
+    let quality: number;
+    let reason: string;
+
+    if (latency < 100 && cpuLoad < 0.5 && userCount <= 2) {
+      fps = 24;
+      quality = 85;
+      reason = 'optimal';
+    } else if (latency < 200 && cpuLoad < 0.7) {
+      fps = 15;
+      quality = 70;
+      reason = 'good';
+    } else if (latency < 400) {
+      fps = 10;
+      quality = 55;
+      reason = 'degraded';
+    } else {
+      fps = 5;
+      quality = 40;
+      reason = 'poor';
+    }
+
+    // Cap fps if CPU is high
+    if (cpuLoad > 0.8 && fps > 10) {
+      fps = 10;
+      reason += '+cpu-cap';
+    }
+
+    const changed = rb.currentFps !== fps || rb.currentQuality !== quality;
+    if (changed) {
+      rb.currentFps = fps;
+      rb.currentQuality = quality;
+      this.restartStreamWithNewSettings(roomId);
+    }
+
+    return { changed, fps, quality, reason };
+  }
+
+  /**
+   * Apply a manual quality preset. 'auto' re-enables adaptive mode.
+   */
+  setQualityPreset(
+    roomId: string,
+    preset: QualityPreset
+  ): { fps: number; quality: number; reason: string } | null {
+    const rb = this.roomBrowsers.get(roomId);
+    if (!rb) return null;
+
+    if (preset === 'auto') {
+      rb.manualPreset = null;
+      return { fps: rb.currentFps, quality: rb.currentQuality, reason: 'auto' };
+    }
+
+    const settings = PRESETS[preset];
+    rb.manualPreset = preset;
+    rb.currentFps = settings.fps;
+    rb.currentQuality = settings.quality;
+    this.restartStreamWithNewSettings(roomId);
+
+    return { fps: settings.fps, quality: settings.quality, reason: `preset:${preset}` };
+  }
+
+  getRoomBrowserInfo(roomId: string): Pick<RoomBrowser, 'currentFps' | 'currentQuality' | 'manualPreset' | 'lastLatency'> | null {
+    const rb = this.roomBrowsers.get(roomId);
+    if (!rb) return null;
+    return {
+      currentFps: rb.currentFps,
+      currentQuality: rb.currentQuality,
+      manualPreset: rb.manualPreset,
+      lastLatency: rb.lastLatency,
+    };
   }
 
   async navigate(roomId: string, url: string): Promise<string> {

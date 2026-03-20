@@ -1,8 +1,10 @@
-import { Router, Request, Response } from 'express';
+import { Router, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { nanoid } from 'nanoid';
+import { RoomManager } from '../services/roomManager';
+import { createAuthMiddleware, AuthenticatedRequest } from '../middleware/auth';
 
 const uploadsDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -20,7 +22,7 @@ const storage = multer.diskStorage({
   },
 });
 
-const fileFilter = (_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+const fileFilter = (_req: AuthenticatedRequest, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
   const allowed = [
     'image/jpeg', 'image/png', 'image/gif', 'image/webp',
     'application/pdf',
@@ -44,13 +46,27 @@ const upload = multer({
   },
 });
 
-export function fileRoutes(): Router {
-  const router = Router();
+// Track uploads per room: roomId -> Set<filename>
+const roomFiles: Map<string, Set<string>> = new Map();
 
-  router.post('/upload', upload.single('file'), (req: Request, res: Response) => {
+function getRoomFiles(roomId: string): Set<string> {
+  if (!roomFiles.has(roomId)) {
+    roomFiles.set(roomId, new Set());
+  }
+  return roomFiles.get(roomId)!;
+}
+
+export function fileRoutes(roomManager: RoomManager): Router {
+  const router = Router();
+  const auth = createAuthMiddleware(roomManager);
+
+  router.post('/upload', auth, upload.single('file'), (req: AuthenticatedRequest, res: Response) => {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
+
+    const roomId = req.user!.roomId;
+    getRoomFiles(roomId).add(req.file.filename);
 
     const fileUrl = `/uploads/${req.file.filename}`;
 
@@ -65,23 +81,46 @@ export function fileRoutes(): Router {
     });
   });
 
-  // Cleanup old files (older than 24h) - endpoint for manual trigger
-  router.delete('/cleanup', async (_req: Request, res: Response) => {
+  // List files for the authenticated user's room
+  router.get('/list', auth, (req: AuthenticatedRequest, res: Response) => {
+    const roomId = req.user!.roomId;
+    const files = getRoomFiles(roomId);
+    const fileList = Array.from(files).map(filename => {
+      const filePath = path.join(uploadsDir, filename);
+      let size = 0;
+      try {
+        size = fs.statSync(filePath).size;
+      } catch {
+        // file may have been deleted
+      }
+      return {
+        url: `/uploads/${filename}`,
+        filename,
+        size,
+      };
+    });
+
+    res.json({ success: true, files: fileList });
+  });
+
+  // Cleanup files belonging to the authenticated user's room
+  router.delete('/cleanup', auth, async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const files = fs.readdirSync(uploadsDir);
-      const now = Date.now();
-      const maxAge = 24 * 60 * 60 * 1000;
+      const roomId = req.user!.roomId;
+      const files = getRoomFiles(roomId);
       let deleted = 0;
 
-      for (const file of files) {
-        const filePath = path.join(uploadsDir, file);
-        const stat = fs.statSync(filePath);
-        if (now - stat.mtimeMs > maxAge) {
+      for (const filename of Array.from(files)) {
+        const filePath = path.join(uploadsDir, filename);
+        try {
           fs.unlinkSync(filePath);
           deleted++;
+        } catch {
+          // File may already be gone
         }
       }
 
+      roomFiles.delete(roomId);
       res.json({ success: true, deleted });
     } catch (err: any) {
       res.status(500).json({ error: err.message });

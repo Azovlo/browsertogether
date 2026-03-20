@@ -82,10 +82,12 @@ export function setupSocketHandlers(
         };
         addMessage(room.id, systemMsg);
 
+        const hostUser = room.users.get(userId);
         callback({
           success: true,
           room: roomManager.serializeRoom(room),
           userId,
+          sessionToken: hostUser?.sessionToken ?? '',
           messages: getRoomMessages(room.id),
         });
 
@@ -134,10 +136,12 @@ export function setupSocketHandlers(
           message: systemMsg,
         });
 
+        const joinedUser = room.users.get(userId);
         callback({
           success: true,
           room: roomManager.serializeRoom(room),
           userId,
+          sessionToken: joinedUser?.sessionToken ?? '',
           messages: getRoomMessages(room.id),
         });
 
@@ -245,6 +249,43 @@ export function setupSocketHandlers(
       if (url) {
         roomManager.updateRoomUrl(roomId, url);
         io.to(`room:${roomId}`).emit('browser:url-changed', { url });
+      }
+    });
+
+    // ─── ADAPTIVE STREAMING ───────────────────────────────────────────────────
+    socket.on('stream:ping', ({ timestamp }: { timestamp: number }) => {
+      socket.emit('stream:pong', { timestamp });
+    });
+
+    // Client reports round-trip latency every ~5s
+    socket.on('stream:latency', ({ latency }: { latency: number }) => {
+      const { roomId } = socket.data;
+      if (!roomId) return;
+
+      const room = roomManager.getRoom(roomId);
+      const userCount = room ? room.users.size : 1;
+
+      const result = browserService.adaptQuality(roomId, latency, userCount);
+      if (result && result.changed) {
+        io.to(`room:${roomId}`).emit('stream:quality-change', {
+          fps: result.fps,
+          quality: result.quality,
+          reason: result.reason,
+        });
+      }
+    });
+
+    socket.on('stream:set-quality', ({ preset }: { preset: 'low' | 'medium' | 'high' | 'auto' }) => {
+      const { roomId } = socket.data;
+      if (!roomId) return;
+
+      const result = browserService.setQualityPreset(roomId, preset);
+      if (result) {
+        io.to(`room:${roomId}`).emit('stream:quality-change', {
+          fps: result.fps,
+          quality: result.quality,
+          reason: result.reason,
+        });
       }
     });
 
