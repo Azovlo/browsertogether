@@ -21,52 +21,113 @@ const PRESETS: Record<Exclude<QualityPreset, 'auto'>, { fps: number; quality: nu
   high:   { fps: 24, quality: 85 },
 };
 
+const BROWSER_POOL_MAX = 3;
+
+const CHROMIUM_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--no-first-run',
+  '--no-zygote',
+  '--disable-gpu',
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--disable-breakpad',
+  '--disable-client-side-phishing-detection',
+  '--disable-crash-reporter',
+  '--disable-oopr-debug-crash-dump',
+  '--disable-translate',
+  '--metrics-recording-only',
+  '--no-crash-upload',
+  '--safebrowsing-disable-auto-update',
+];
+
 export class BrowserService extends EventEmitter {
-  private browser: Browser | null = null;
+  private browserPool: Browser[] = [];
+  // track which browser each room uses
+  private roomBrowserIndex: Map<string, number> = new Map();
   private roomBrowsers: Map<string, RoomBrowser> = new Map();
 
-  async init(): Promise<void> {
-    if (this.browser) return;
-
-    console.log('Launching Chromium browser...');
-    this.browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-breakpad',
-        '--disable-client-side-phishing-detection',
-        '--disable-crash-reporter',
-        '--disable-oopr-debug-crash-dump',
-        '--disable-translate',
-        '--metrics-recording-only',
-        '--no-crash-upload',
-        '--safebrowsing-disable-auto-update',
-      ],
+  private async launchBrowser(): Promise<Browser> {
+    const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+    browser.on('disconnected', () => {
+      const idx = this.browserPool.indexOf(browser);
+      if (idx !== -1) {
+        console.error(`[BrowserService] Browser at pool index ${idx} crashed, removing from pool`);
+        this.browserPool.splice(idx, 1);
+        // Update roomBrowserIndex for remaining browsers and close affected rooms
+        for (const [roomId, bi] of this.roomBrowserIndex.entries()) {
+          if (bi === idx) {
+            this.roomBrowserIndex.delete(roomId);
+            const rb = this.roomBrowsers.get(roomId);
+            if (rb?.screenshotInterval) clearInterval(rb.screenshotInterval);
+            this.roomBrowsers.delete(roomId);
+            console.error(`[BrowserService] Room ${roomId} lost its browser due to crash`);
+          } else if (bi > idx) {
+            this.roomBrowserIndex.set(roomId, bi - 1);
+          }
+        }
+      }
     });
+    return browser;
+  }
 
-    console.log('Chromium launched successfully');
+  private async getBrowserForRoom(): Promise<{ browser: Browser; index: number }> {
+    // Count pages per pool browser
+    const pageCounts = await Promise.all(
+      this.browserPool.map(async (b) => {
+        try { return (await b.contexts()).reduce((s, c) => s + c.pages().length, 0); }
+        catch { return Infinity; }
+      })
+    );
+
+    // Find browser with least pages
+    let minPages = Infinity;
+    let minIdx = -1;
+    for (let i = 0; i < pageCounts.length; i++) {
+      if (pageCounts[i] < minPages) {
+        minPages = pageCounts[i];
+        minIdx = i;
+      }
+    }
+
+    // Launch new if pool not full
+    if (this.browserPool.length < BROWSER_POOL_MAX && (minIdx === -1 || minPages > 0)) {
+      console.log(`[BrowserService] Launching new browser (pool size: ${this.browserPool.length + 1})`);
+      const browser = await this.launchBrowser();
+      this.browserPool.push(browser);
+      return { browser, index: this.browserPool.length - 1 };
+    }
+
+    if (minIdx === -1) throw new Error('No available browser in pool');
+    return { browser: this.browserPool[minIdx], index: minIdx };
+  }
+
+  getPoolStats(): { total: number; active: number; roomsPerBrowser: number[] } {
+    const roomsPerBrowser = new Array<number>(this.browserPool.length).fill(0);
+    for (const bi of this.roomBrowserIndex.values()) {
+      if (bi < roomsPerBrowser.length) roomsPerBrowser[bi]++;
+    }
+    return {
+      total: this.browserPool.length,
+      active: this.roomBrowsers.size,
+      roomsPerBrowser,
+    };
   }
 
   async createRoomBrowser(roomId: string, initialUrl = 'https://www.google.com'): Promise<void> {
-    await this.init();
-    if (!this.browser) throw new Error('Browser not initialized');
+    const { browser, index } = await this.getBrowserForRoom();
+    this.roomBrowserIndex.set(roomId, index);
 
     if (this.roomBrowsers.has(roomId)) {
       await this.closeRoomBrowser(roomId);
     }
 
-    const context = await this.browser.newContext({
+    const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
@@ -342,9 +403,10 @@ export class BrowserService extends EventEmitter {
       await this.closeRoomBrowser(roomId);
     }
 
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
+    for (const browser of this.browserPool) {
+      await browser.close().catch(() => {});
     }
+    this.browserPool = [];
+    this.roomBrowserIndex.clear();
   }
 }

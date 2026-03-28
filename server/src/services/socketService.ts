@@ -1,42 +1,40 @@
 import { Server, Socket } from 'socket.io';
 import { RoomManager } from './roomManager';
 import { BrowserService } from './browserService';
+import { ChatStorage, ChatMessage } from './chatStorage';
 import { nanoid } from 'nanoid';
 
-interface ChatMessage {
-  id: string;
-  userId: string;
-  userName: string;
-  avatar: string;
-  content: string;
-  type: 'text' | 'sticker' | 'file' | 'system';
-  timestamp: Date;
-  reactions: Record<string, string[]>; // emoji -> userIds[]
-  fileData?: {
-    url: string;
-    name: string;
-    size: number;
-    mimeType: string;
-  };
-}
+const chatStorage = new ChatStorage();
 
-// Store messages per room (in memory, limit to last 100)
-const roomMessages = new Map<string, ChatMessage[]>();
+// ─── Rate limiting ─────────────────────────────────────────────────────────────
+// Map<socketId, Map<eventName, lastTimestamp>>
+const rateLimitMap = new Map<string, Map<string, number>>();
 
-function getRoomMessages(roomId: string): ChatMessage[] {
-  if (!roomMessages.has(roomId)) {
-    roomMessages.set(roomId, []);
+const RATE_LIMITS: Record<string, number> = {
+  'browser:click':     50,
+  'browser:mousemove': 50,
+  'browser:scroll':    50,
+  'browser:keypress':  50,
+  'browser:type':      50,
+  'browser:navigate':  500,
+};
+
+function isRateLimited(socketId: string, event: string): boolean {
+  const limit = RATE_LIMITS[event];
+  if (!limit) return false;
+
+  let socketMap = rateLimitMap.get(socketId);
+  if (!socketMap) {
+    socketMap = new Map();
+    rateLimitMap.set(socketId, socketMap);
   }
-  return roomMessages.get(roomId)!;
-}
 
-function addMessage(roomId: string, message: ChatMessage): void {
-  const messages = getRoomMessages(roomId);
-  messages.push(message);
-  // Keep only last 100 messages
-  if (messages.length > 100) {
-    messages.shift();
-  }
+  const now = Date.now();
+  const last = socketMap.get(event) ?? 0;
+  if (now - last < limit) return true;
+
+  socketMap.set(event, now);
+  return false;
 }
 
 export function setupSocketHandlers(
@@ -80,7 +78,7 @@ export function setupSocketHandlers(
           timestamp: new Date(),
           reactions: {},
         };
-        addMessage(room.id, systemMsg);
+        chatStorage.addMessage(room.id, systemMsg);
 
         const hostUser = room.users.get(userId);
         callback({
@@ -88,7 +86,7 @@ export function setupSocketHandlers(
           room: roomManager.serializeRoom(room),
           userId,
           sessionToken: hostUser?.sessionToken ?? '',
-          messages: getRoomMessages(room.id),
+          messages: chatStorage.getMessages(room.id),
         });
 
         console.log(`Room created: ${room.id} by ${userName}`);
@@ -128,7 +126,7 @@ export function setupSocketHandlers(
           timestamp: new Date(),
           reactions: {},
         };
-        addMessage(room.id, systemMsg);
+        chatStorage.addMessage(room.id, systemMsg);
 
         // Notify other users
         socket.to(`room:${room.id}`).emit('room:user-joined', {
@@ -142,7 +140,7 @@ export function setupSocketHandlers(
           room: roomManager.serializeRoom(room),
           userId,
           sessionToken: joinedUser?.sessionToken ?? '',
-          messages: getRoomMessages(room.id),
+          messages: chatStorage.getMessages(room.id),
         });
 
         console.log(`User ${userName} joined room ${room.id}`);
@@ -153,11 +151,12 @@ export function setupSocketHandlers(
 
     // ─── LEAVE ROOM ───────────────────────────────────────────────────────────
     socket.on('room:leave', async () => {
-      await handleDisconnect(socket, io, roomManager, browserService, roomMessages);
+      await handleDisconnect(socket, io, roomManager, browserService);
     });
 
     // ─── BROWSER CONTROLS ─────────────────────────────────────────────────────
     socket.on('browser:navigate', async ({ url }: { url: string }, callback) => {
+      if (isRateLimited(socket.id, 'browser:navigate')) return;
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
@@ -175,6 +174,7 @@ export function setupSocketHandlers(
     });
 
     socket.on('browser:click', async ({ x, y }: { x: number; y: number }) => {
+      if (isRateLimited(socket.id, 'browser:click')) return;
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
@@ -185,6 +185,7 @@ export function setupSocketHandlers(
     });
 
     socket.on('browser:scroll', async ({ x, y, deltaX, deltaY }: { x: number; y: number; deltaX: number; deltaY: number }) => {
+      if (isRateLimited(socket.id, 'browser:scroll')) return;
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
@@ -195,6 +196,7 @@ export function setupSocketHandlers(
     });
 
     socket.on('browser:mousemove', async ({ x, y }: { x: number; y: number }) => {
+      if (isRateLimited(socket.id, 'browser:mousemove')) return;
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
@@ -205,6 +207,7 @@ export function setupSocketHandlers(
     });
 
     socket.on('browser:keypress', async ({ key }: { key: string }) => {
+      if (isRateLimited(socket.id, 'browser:keypress')) return;
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
@@ -215,6 +218,7 @@ export function setupSocketHandlers(
     });
 
     socket.on('browser:type', async ({ text }: { text: string }) => {
+      if (isRateLimited(socket.id, 'browser:type')) return;
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
@@ -377,7 +381,7 @@ export function setupSocketHandlers(
         fileData,
       };
 
-      addMessage(roomId, message);
+      chatStorage.addMessage(roomId, message);
       io.to(`room:${roomId}`).emit('chat:message', message);
     });
 
@@ -385,7 +389,7 @@ export function setupSocketHandlers(
       const { roomId, userId } = socket.data;
       if (!roomId || !userId) return;
 
-      const messages = getRoomMessages(roomId);
+      const messages = chatStorage.getMessages(roomId);
       const msg = messages.find(m => m.id === messageId);
       if (!msg) return;
 
@@ -411,7 +415,8 @@ export function setupSocketHandlers(
 
     // ─── DISCONNECT ───────────────────────────────────────────────────────────
     socket.on('disconnect', async () => {
-      await handleDisconnect(socket, io, roomManager, browserService, roomMessages);
+      rateLimitMap.delete(socket.id);
+      await handleDisconnect(socket, io, roomManager, browserService);
     });
   });
 }
@@ -421,7 +426,6 @@ async function handleDisconnect(
   io: Server,
   roomManager: RoomManager,
   browserService: BrowserService,
-  roomMessages: Map<string, any[]>
 ): Promise<void> {
   const { roomId, userId } = socket.data;
   if (!roomId || !userId) return;
@@ -436,14 +440,14 @@ async function handleDisconnect(
   socket.data.userId = null;
 
   if (!room) {
-    // Room is empty, close browser
+    // Room is empty, close browser and delete chat
     await browserService.closeRoomBrowser(roomId).catch(() => {});
-    roomMessages.delete(roomId);
+    chatStorage.deleteRoom(roomId);
     console.log(`Room ${roomId} deleted (empty)`);
     return;
   }
 
-  const systemMsg = {
+  const systemMsg: ChatMessage = {
     id: nanoid(),
     userId: 'system',
     userName: 'System',
@@ -456,8 +460,7 @@ async function handleDisconnect(
     reactions: {},
   };
 
-  const msgs = roomMessages.get(roomId);
-  if (msgs) msgs.push(systemMsg);
+  chatStorage.addMessage(roomId, systemMsg);
 
   io.to(`room:${roomId}`).emit('room:user-left', {
     userId,

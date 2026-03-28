@@ -10,6 +10,7 @@ export interface User {
   avatar: string;
   joinedAt: Date;
   sessionToken: string;
+  tokenExpiresAt: Date;
 }
 
 export interface Room {
@@ -24,6 +25,8 @@ export interface Room {
   isLocked: boolean;
   controlRequestQueue: string[]; // user IDs waiting for control
 }
+
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export class RoomManager {
   private rooms: Map<string, Room> = new Map();
@@ -55,6 +58,7 @@ export class RoomManager {
       avatar: this.generateAvatar(hostName),
       joinedAt: new Date(),
       sessionToken: crypto.randomBytes(32).toString('hex'),
+      tokenExpiresAt: new Date(Date.now() + TOKEN_TTL_MS),
     };
 
     const room: Room = {
@@ -89,6 +93,7 @@ export class RoomManager {
       avatar: this.generateAvatar(userName),
       joinedAt: new Date(),
       sessionToken: crypto.randomBytes(32).toString('hex'),
+      tokenExpiresAt: new Date(Date.now() + TOKEN_TTL_MS),
     };
 
     room.users.set(userId, user);
@@ -155,11 +160,26 @@ export class RoomManager {
     for (const room of this.rooms.values()) {
       for (const user of room.users.values()) {
         if (user.sessionToken === token) {
+          if (user.tokenExpiresAt < new Date()) {
+            return null; // Token expired
+          }
           return { userId: user.id, roomId: room.id };
         }
       }
     }
     return null;
+  }
+
+  refreshToken(roomId: string, userId: string): string | null {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+
+    const user = room.users.get(userId);
+    if (!user) return null;
+
+    user.sessionToken = crypto.randomBytes(32).toString('hex');
+    user.tokenExpiresAt = new Date(Date.now() + TOKEN_TTL_MS);
+    return user.sessionToken;
   }
 
   transferControl(roomId: string, toUserId: string): boolean {
