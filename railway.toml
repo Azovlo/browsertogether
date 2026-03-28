@@ -1,0 +1,17 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "node server/dist/index.js"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "browsertogether"
+
+[services.variables]
+NODE_ENV = "production"
+PORT = "3001"
+MAX_ROOMS = "20"
+MAX_USERS_PER_ROOM = "6"

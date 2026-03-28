@@ -16,13 +16,16 @@ dotenv.config();
 
 const PORT = process.env.PORT || 3001;
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+const isProduction = process.env.NODE_ENV === 'production';
 
 const app = express();
 const httpServer = createServer(app);
 
+const corsOrigin = isProduction ? true : CLIENT_URL;
+
 const io = new Server(httpServer, {
   cors: {
-    origin: CLIENT_URL,
+    origin: corsOrigin,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -35,7 +38,7 @@ app.use(helmet({
   contentSecurityPolicy: false,
 }));
 app.use(cors({
-  origin: CLIENT_URL,
+  origin: corsOrigin,
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -56,6 +59,15 @@ app.use('/api/files', fileRoutes(roomManager));
 app.get('/health', (_, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// Serve React client in production
+if (process.env.NODE_ENV === 'production') {
+  const clientBuild = path.join(__dirname, 'public');
+  app.use(express.static(clientBuild));
+  app.get('*', (_, res) => {
+    res.sendFile(path.join(clientBuild, 'index.html'));
+  });
+}
 
 // Setup Socket.io handlers
 setupSocketHandlers(io, roomManager, browserService);
